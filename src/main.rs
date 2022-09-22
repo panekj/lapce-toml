@@ -1,10 +1,13 @@
-use anyhow::Result;
+use std::fs::File;
+
+use anyhow::{anyhow, Result};
+use flate2::read::GzDecoder;
 use lapce_plugin::{
-    psp_types::{
-        lsp_types::{request::Initialize, DocumentFilter, DocumentSelector, InitializeParams, Url},
-        Request,
-    },
-    register_plugin, LapcePlugin, VoltEnvironment, PLUGIN_RPC,
+  psp_types::{
+    lsp_types::{request::Initialize, DocumentFilter, DocumentSelector, InitializeParams, Url},
+    Request,
+  },
+  register_plugin, Http, LapcePlugin, VoltEnvironment, PLUGIN_RPC,
 };
 use serde_json::Value;
 
@@ -13,110 +16,100 @@ struct State {}
 
 register_plugin!(State);
 
+macro_rules! string {
+  ( $x:expr ) => {
+    String::from($x)
+  };
+}
+
+const LSP_VERSION: &str = "0.7.1";
+
 fn initialize(params: InitializeParams) -> Result<()> {
-    let document_selector: DocumentSelector = vec![DocumentFilter {
-        // lsp language id
-        language: Some(String::from("language_id")),
-        // glob pattern
-        pattern: Some(String::from("**/*.{ext1,ext2}")),
-        // like file:
-        scheme: None,
-    }];
-    let mut server_args = vec![];
+  let document_selector: DocumentSelector = vec![DocumentFilter {
+    language: Some(string!("toml")),
+    pattern: Some(string!("**/*.toml")),
+    scheme: None,
+  }];
+  let mut server_args = vec![string!("lsp"), string!("stdio")];
 
-    // Check for user specified LSP server path
-    // ```
-    // [lapce-plugin-name.lsp]
-    // serverPath = "[path or filename]"
-    // serverArgs = ["--arg1", "--arg2"]
-    // ```
-    if let Some(options) = params.initialization_options.as_ref() {
-        if let Some(lsp) = options.get("lsp") {
-            if let Some(args) = lsp.get("serverArgs") {
-                if let Some(args) = args.as_array() {
-                    if !args.is_empty() {
-                        server_args = vec![];
-                    }
-                    for arg in args {
-                        if let Some(arg) = arg.as_str() {
-                            server_args.push(arg.to_string());
-                        }
-                    }
-                }
-            }
-
-            if let Some(server_path) = lsp.get("serverPath") {
-                if let Some(server_path) = server_path.as_str() {
-                    if !server_path.is_empty() {
-                        let server_uri = Url::parse(&format!("urn:{}", server_path))?;
-                        PLUGIN_RPC.start_lsp(
-                            server_uri,
-                            server_args,
-                            document_selector,
-                            params.initialization_options,
-                        );
-                        return Ok(());
-                    }
-                }
-            }
+  if let Some(options) = params.initialization_options.as_ref() {
+    if let Some(volt) = options.get("volt") {
+      if let Some(args) = volt.get("serverArgs") {
+        if let Some(args) = args.as_array() {
+          server_args = args.into_iter().map(|s| s.to_string()).collect();
         }
+      }
+
+      if let Some(server_path) = volt.get("serverPath") {
+        if let Some(server_path) = server_path.as_str() {
+          if !server_path.is_empty() {
+            let server_uri = Url::parse(&format!("urn:{}", server_path))?;
+            PLUGIN_RPC.start_lsp(
+              server_uri,
+              server_args,
+              document_selector,
+              params.initialization_options,
+            );
+            return Ok(());
+          }
+        }
+      }
     }
+  }
 
-    // Architecture check
-    let _ = match VoltEnvironment::architecture().as_deref() {
-        Ok("x86_64") => "x86_64",
-        Ok("aarch64") => "aarch64",
-        _ => return Ok(()),
-    };
+  let arch = match VoltEnvironment::architecture().as_deref() {
+    | Ok("x86_64") => "x86_64",
+    | Ok("aarch64") => "aarch64",
+    | Ok(v) => return Err(anyhow!("Unsupported ARCH: {}", v)),
+    | Err(e) => return Err(anyhow!("Error ARCH: {}", e)),
+  };
 
-    // OS check
-    let _ = match VoltEnvironment::operating_system().as_deref() {
-        Ok("macos") => "macos",
-        Ok("linux") => "linux",
-        Ok("windows") => "windows",
-        _ => return Ok(()),
-    };
+  let os = match VoltEnvironment::operating_system().as_deref() {
+    | Ok("macos") => "darwin",
+    | Ok("linux") => "linux",
+    | Ok("windows") => "windows",
+    | Ok(v) => return Err(anyhow!("Unsupported OS: {}", v)),
+    | Err(e) => return Err(anyhow!("Error OS: {}", e)),
+  };
 
-    // Download URL
-    // let _ = format!("https://github.com/<name>/<project>/releases/download/<version>/{filename}");
+  let gz_file = format!("taplo-full-{os}-{arch}.gz");
 
-    // see lapce_plugin::Http for available API to download files
+  let download_url =
+    format!("https://github.com/panekj/taplo/releases/download/{LSP_VERSION}/{gz_file}");
 
-    let _ = match VoltEnvironment::operating_system().as_deref() {
-        Ok("windows") => {
-            format!("{}.exe", "[filename]")
-        }
-        _ => "[filename]".to_string(),
-    };
+  let mut resp = Http::get(&download_url)?;
+  PLUGIN_RPC.stderr(&format!("STATUS_CODE: {:?}", resp.status_code));
+  let body = resp.body_read_all()?;
+  std::fs::write(&gz_file, body)?;
+  let mut gz = GzDecoder::new(File::open(&gz_file)?);
+  let mut file = File::create("taplo")?;
+  std::io::copy(&mut gz, &mut file)?;
+  std::fs::remove_file(&gz_file)?;
 
-    // Plugin working directory
-    let volt_uri = VoltEnvironment::uri()?;
-    let server_path = Url::parse(&volt_uri)?.join("[filename]")?;
+  let volt_uri = VoltEnvironment::uri()?;
+  let server_path = Url::parse(&volt_uri)?.join("taplo")?;
 
-    // if you want to use server from PATH
-    // let server_path = Url::parse(&format!("urn:{filename}"))?;
+  PLUGIN_RPC.start_lsp(
+    server_path,
+    server_args,
+    document_selector,
+    params.initialization_options,
+  );
 
-    // Available language IDs
-    // https://github.com/lapce/lapce/blob/HEAD/lapce-proxy/src/buffer.rs#L173
-    PLUGIN_RPC.start_lsp(
-        server_path,
-        server_args,
-        document_selector,
-        params.initialization_options,
-    );
-
-    Ok(())
+  Ok(())
 }
 
 impl LapcePlugin for State {
-    fn handle_request(&mut self, _id: u64, method: String, params: Value) {
-        #[allow(clippy::single_match)]
-        match method.as_str() {
-            Initialize::METHOD => {
-                let params: InitializeParams = serde_json::from_value(params).unwrap();
-                let _ = initialize(params);
-            }
-            _ => {}
+  fn handle_request(&mut self, _id: u64, method: String, params: Value) {
+    #[allow(clippy::single_match)]
+    match method.as_str() {
+      | Initialize::METHOD => {
+        let params: InitializeParams = serde_json::from_value(params).unwrap();
+        if let Err(e) = initialize(params) {
+          PLUGIN_RPC.stderr(&format!("plugin returned with error: {e}"))
         }
+      }
+      | _ => {}
     }
+  }
 }

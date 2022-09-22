@@ -1,6 +1,19 @@
-name = "<plugin-name>"
+name = "lapce-toml"
 version = "0.0.0"
-author = "<your name>"
-display-name = "<plugin-display-name>"
-description = "<plugin-description>"
-wasm = "bin/<plugin-name>.wasm"
+author = "panekj"
+display-name = "TOML"
+description = "TOML for Lapce"
+wasm = "bin/lapce-toml.wasm"
+
+[activation]
+language = ["toml"]
+workspace-contains = ["*/*.toml"]
+
+[config."volt.serverPath"]
+default = ""
+
+[config."volt.serverArgs"]
+default = [
+  "lsp",
+  "stdio"
+]
